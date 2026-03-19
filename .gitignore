@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Weights & Biases
+wandb/
+
+# Training artifacts / checkpoints
+lora_attn/
+*.pt
+*.pth
+*.ckpt
+
+# Logs / job outputs
+log/
+*.log
+*.out
+*.err
+nohup.out
+

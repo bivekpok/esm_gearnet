@@ -1,0 +1,79 @@
+project: OPMesm-protein-localization
+entity: udel
+
+program: train_sweep.py
+method: bayes
+metric:
+  name: val_loss
+  goal: minimize
+
+# Early stopping to kill bad runs quickly
+early_terminate:
+  type: hyperband
+  min_iter: 5
+  eta: 3
+
+parameters:
+  # Shifted Down: Model wants to explore below 5e-5
+  lr_classifier:
+    distribution: log_uniform_values
+    min: 0.00001  # 1e-5
+    max: 0.0001   # 1e-4
+    
+  # Shifted Up: Model wants to explore above 5e-5
+  lr_esmc:
+    distribution: log_uniform_values
+    min: 0.00001  # 1e-5
+    max: 0.0001   # 1e-4
+    
+  # Narrowed: '4' is the dominant winner
+  lora_r:
+    values: [2, 4, 8]
+    
+  # Centered: Covering the spread of the top 10 runs
+  lora_dropout:
+    distribution: uniform
+    min: 0.15
+    max: 0.45
+
+  # Shifted Up: The model maxed out at 0.4, offering 0.5 to see if it improves
+  classify_dropout:
+    values: [0.3, 0.4, 0.5]
+
+
+
+# # sweep.yaml
+# project: OPMesm-protein-localization
+# entity: udel
+
+# program: train_sweep.py
+# method: bayes
+# metric:
+#   name: val_loss
+#   goal: minimize
+
+# parameters:
+#   # Learning rates search best on a logarithmic scale
+#   lr_classifier:
+#     distribution: log_uniform_values
+#     min: 0.00005  # 5e-5
+#     max: 0.001    # 1e-3
+    
+#   lr_esmc:
+#     distribution: log_uniform_values
+#     min: 0.000001 # 1e-6
+#     max: 0.00005  # 5e-5
+    
+#   # LoRA Rank should be discrete choices
+#   lora_r:
+#     values: [4, 8, 16, 32]
+    
+#   # Dropout is standard uniform
+#   lora_dropout:
+#     distribution: uniform
+#     min: 0.1
+#     max: 0.5
+
+#   # Classifier Dropout (Merged into the main parameters block)
+#   classify_dropout:
+#     values: [0.1, 0.2, 0.3, 0.4]
