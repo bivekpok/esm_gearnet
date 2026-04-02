@@ -2,7 +2,7 @@ import torch
 import pandas as pd
 import os
 from torch.utils.data import Dataset, DataLoader, Subset
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedShuffleSplit
 from collections import Counter
 
 class Config:
@@ -11,6 +11,9 @@ class Config:
 
     # Path where validation indices will be saved
     val_indices_path = "/work/hdd/bdja/bpokhrel/esm_new2/val_indices.pt"
+    
+    # Path where the generated nested CV folds will be saved
+    cv_splits_dir = "/work/hdd/bdja/bpokhrel/esm_new2/cv_splits"
 
     # Training hyperparameters
     batch_size = 32
@@ -114,8 +117,98 @@ def create_dataloaders():
     # Return loaders AND metadata
     return train_loader, val_loader, dataset.classes, dataset.class_weights
 
+def print_split_stats(df, split_name):
+    """Helper function to print the population and class ratios of a dataframe."""
+    total = len(df)
+    # Sort by index to ensure Class 0 and Class 1 are always printed in the same order
+    counts = df['label'].value_counts().sort_index()
+    ratios = df['label'].value_counts(normalize=True).sort_index() * 100
+    
+    # Format a neat, aligned string
+    stats_str = f"{split_name:<30} | Total: {total:<5} | "
+    class_stats = []
+    for cls in counts.index:
+        class_stats.append(f"Class {cls}: {counts[cls]} ({ratios[cls]:.1f}%)")
+    
+    stats_str += " | ".join(class_stats)
+    print(stats_str)
+
+def generate_hybrid_splits(csv_path=None, output_root="cv_splits", n_outer=6, n_inner_for_tune=3):
+    if csv_path is None:
+        csv_path = config.label_csv
+        
+    df = pd.read_csv(csv_path)
+    os.makedirs(output_root, exist_ok=True)
+
+    print("="*85)
+    print_split_stats(df, "FULL ORIGINAL DATASET")
+    print("="*85)
+
+    # 1. OUTER LOOP: Create the 6 Test Sets
+    outer_skf = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=65)
+
+    for out_idx, (remainder_idx, test_idx) in enumerate(outer_skf.split(df, df['label'])):
+        outer_num = out_idx + 1
+        outer_path = os.path.join(output_root, f"Outer_Fold_{outer_num}")
+        os.makedirs(outer_path, exist_ok=True)
+        
+        # Save the Test Set
+        test_df = df.iloc[test_idx]
+        test_df.to_csv(os.path.join(outer_path, "test_manifest.csv"), index=False)
+        remainder_df = df.iloc[remainder_idx].reset_index(drop=True)
+
+        print(f"\n--- OUTER FOLD {outer_num} ---")
+        print_split_stats(test_df, f"Outer {outer_num} TEST SET")
+
+        # 2. INNER LOOP LOGIC
+        if outer_num == 1:
+            # --- FOLD 1: Create 3 Inner Folds for Hyperparameter Sweeping ---
+            # Swapped to StratifiedShuffleSplit so we can force a 10% val size while keeping 3 splits
+            inner_sss = StratifiedShuffleSplit(n_splits=n_inner_for_tune, test_size=0.08, random_state=65)
+            
+            for in_idx, (train_idx, val_idx) in enumerate(inner_sss.split(remainder_df, remainder_df['label'])):
+                inner_path = os.path.join(outer_path, f"Inner_Fold_{in_idx + 1}")
+                os.makedirs(inner_path, exist_ok=True)
+                
+                train_df = remainder_df.iloc[train_idx]
+                val_df = remainder_df.iloc[val_idx]
+                
+                train_df.to_csv(os.path.join(inner_path, "train_manifest.csv"), index=False)
+                val_df.to_csv(os.path.join(inner_path, "valid_manifest.csv"), index=False)
+                
+                print_split_stats(train_df, f"  Inner {in_idx + 1} TRAIN SET")
+                print_split_stats(val_df, f"  Inner {in_idx + 1} VALID SET")
+            
+        else:
+            # --- FOLDS 2 to 6: Create exactly 1 Inner Fold for Final Training ---
+            # Shrunk test_size from 0.20 down to 0.10
+            train_df, val_df = train_test_split(
+                remainder_df, 
+                test_size=0.08, 
+                random_state=65, 
+                stratify=remainder_df['label']
+            )
+            
+            inner_path = os.path.join(outer_path, "Inner_Fold_1")
+            os.makedirs(inner_path, exist_ok=True)
+            
+            train_df.to_csv(os.path.join(inner_path, "train_manifest.csv"), index=False)
+            val_df.to_csv(os.path.join(inner_path, "valid_manifest.csv"), index=False)
+            
+            print_split_stats(train_df, f"  Inner 1 TRAIN SET")
+            print_split_stats(val_df, f"  Inner 1 VALID SET")
+
 if __name__ == "__main__":
     
+    # 1. Generate the Nested Cross-Validation Splits
+    print(f"Generating hybrid splits in {config.cv_splits_dir}...")
+    generate_hybrid_splits(
+        csv_path=config.label_csv,
+        output_root=config.cv_splits_dir
+    )
+    print("\n" + "="*85)
+    
+    # 2. Test the old dataloaders functionality
     # FIXED: Unpack into local variables, not into 'dataset.classes'
     train_loader, val_loader, classes, class_weights = create_dataloaders()
     
