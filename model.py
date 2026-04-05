@@ -220,8 +220,9 @@ class ESMCClassifier(nn.Module):
         
         # Mean Pooling Across the LAYERS (excluding the first/embedding layer)
         # This collapses the layers down, leaving you with [B, L, 960]
-        layer_averaged_hiddens = stacked_hiddens[1:].mean(dim=0)
-        
+        layer_averaged_hiddens = stacked_hiddens[1:].mean(dim=0) # all  layers except the first one
+        # layer_averaged_hiddens = stacked_hiddens[-4:].mean(dim=0) # last 4 layers
+
         embeddings = layer_averaged_hiddens  # (B, L, 960)
         # 
 

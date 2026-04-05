@@ -15,6 +15,8 @@ import json
 import os
 import time
 import argparse
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,6 +24,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from tqdm import tqdm
+from transformers import get_cosine_schedule_with_warmup
+from sklearn.metrics import f1_score, matthews_corrcoef, classification_report
+from collections import Counter
 
 from config import config
 from utils import calculate_metrics, save_checkpoint
@@ -105,6 +110,17 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
               f"Classes: {num_classes} | "
               f"Train batches: {len(train_loader)} | "
               f"Val batches: {len(val_loader)}", flush=True)
+              
+        print("\n--- Class Distribution & Weights ---")
+        _train_csv = os.path.join(config.cv_splits_dir, f"Outer_Fold_{outer_fold}", f"Inner_Fold_{inner_fold}", "train_manifest.csv")
+        _val_csv   = os.path.join(config.cv_splits_dir, f"Outer_Fold_{outer_fold}", f"Inner_Fold_{inner_fold}", "valid_manifest.csv")
+        _train_df = pd.read_csv(_train_csv)
+        _val_df   = pd.read_csv(_val_csv)
+        _train_counts = Counter(_train_df["label"].tolist())
+        _val_counts   = Counter(_val_df["label"].tolist())
+        for i, name in enumerate(class_names):
+            print(f"  Class {i} ({name}): Train={_train_counts.get(name, 0)}, Val={_val_counts.get(name, 0)}, Weight={class_weights[i]:.4f}")
+        print("------------------------------------\n", flush=True)
 
     model = get_model(
         num_classes,
@@ -116,7 +132,11 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
 
     raw_model = model.module if world_size > 1 else model
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device), reduction="sum")
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights.to(device),
+        label_smoothing=getattr(config, "label_smoothing", 0.1),
+        reduction="mean",
+    )
 
     optimizer = optim.AdamW(
         [
@@ -126,11 +146,17 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
         weight_decay=config.weight_decay,
     )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    grad_acc_steps = getattr(config, "gradient_accumulation_steps", 1)
+    total_steps = (len(train_loader) // grad_acc_steps) * config.num_epochs
+    warmup_steps = getattr(config, "warmup_steps", 100)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
     )
 
-    best_val_loss     = float("inf")
+    best_val_macro_f1 = -float("inf")
     epochs_no_improve = 0
     ckpt_path = config.model_save_path.replace(
         ".pt", f"_outer{outer_fold}_inner{inner_fold}.pt"
@@ -146,9 +172,10 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
         train_loss_sum   = 0.0
         train_correct    = 0
         train_samples    = 0
+        
+        optimizer.zero_grad()
 
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Train",
-                          disable=not is_main):
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} Train", disable=not is_main)):
             # region agent log H4
             if epoch == 0 and train_samples == 0:
                 lengths = batch["lengths"]
@@ -170,17 +197,22 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
                     hypothesis_id="H4",
                 )
             # endregion
-            optimizer.zero_grad()
             labels  = batch["labels"].to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = model(batch)
                 loss    = criterion(outputs.float(), labels)
+            
+            # With reduction="mean", accumulate without manual rescaling
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            
+            if (step + 1) % grad_acc_steps == 0 or (step + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
             bs = labels.size(0)
-            train_loss_sum += loss.item()
+            train_loss_sum += loss.item() * bs   # accumulate as sum for per-sample avg later
             train_correct  += (outputs.argmax(dim=1) == labels).sum().item()
             train_samples  += bs
 
@@ -193,6 +225,9 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
         val_loss_sum   = 0.0
         val_correct    = 0
         val_samples    = 0
+        
+        val_preds_list = []
+        val_labels_list = []
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1} Val",
@@ -203,9 +238,14 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
                     loss    = criterion(outputs.float(), labels)
 
                 bs = labels.size(0)
-                val_loss_sum += loss.item()
-                val_correct  += (outputs.argmax(dim=1) == labels).sum().item()
+                val_loss_sum += loss.item() * bs  # keep as sum, divide by total samples later
+                
+                preds = outputs.argmax(dim=1)
+                val_correct  += (preds == labels).sum().item()
                 val_samples  += bs
+                
+                val_preds_list.append(preds)
+                val_labels_list.append(labels)
 
         # ---- Global reduce across GPUs -----------------------------------
         stats = torch.tensor(
@@ -219,24 +259,54 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
         g_val_acc    = (stats[1] / stats[2].clamp(min=1)).item()
         g_train_loss = (stats[3] / stats[5].clamp(min=1)).item()
         g_train_acc  = (stats[4] / stats[5].clamp(min=1)).item()
-
-        scheduler.step(g_val_loss)
+        
+        # Gather preds/labels across ranks — all_gather_object handles uneven splits safely
+        val_preds_tensor  = torch.cat(val_preds_list)
+        val_labels_tensor = torch.cat(val_labels_list)
+        
+        if world_size > 1:
+            gathered_preds  = [None] * world_size
+            gathered_labels = [None] * world_size
+            dist.all_gather_object(gathered_preds,  val_preds_tensor.cpu().numpy())
+            dist.all_gather_object(gathered_labels, val_labels_tensor.cpu().numpy())
+            val_preds_cpu  = np.concatenate(gathered_preds)
+            val_labels_cpu = np.concatenate(gathered_labels)
+        else:
+            val_preds_cpu  = val_preds_tensor.cpu().numpy()
+            val_labels_cpu = val_labels_tensor.cpu().numpy()
+        
+        g_val_macro_f1 = f1_score(val_labels_cpu, val_preds_cpu, average='macro', zero_division=0)
+        g_val_mcc = matthews_corrcoef(val_labels_cpu, val_preds_cpu)
 
         if is_main:
             print(f"Epoch {epoch+1} | "
                   f"Train Loss: {g_train_loss:.4f} | "
-                  f"Val Loss: {g_val_loss:.4f} | Val Acc: {g_val_acc:.4f}", flush=True)
+                  f"Val Loss: {g_val_loss:.4f} | Val Acc: {g_val_acc:.4f} | "
+                  f"Val Macro F1: {g_val_macro_f1:.4f} | Val MCC: {g_val_mcc:.4f}", flush=True)
+            
+            print("\n--- Classification Report ---")
+            print(classification_report(val_labels_cpu, val_preds_cpu, labels=list(range(len(class_names))),target_names=class_names, zero_division=0))
+            print("-----------------------------\n")
+            
             wandb.log({
                 "epoch":      epoch + 1,
                 "train/loss": g_train_loss, "train/acc": g_train_acc,
                 "val/loss":   g_val_loss,   "val/acc":   g_val_acc,
+                "val/macro_f1": g_val_macro_f1, "val/mcc": g_val_mcc,
+                "val/confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=val_labels_cpu.tolist(),
+                    preds=val_preds_cpu.tolist(),
+                    class_names=class_names
+                )
             })
 
-            if g_val_loss < best_val_loss:
-                best_val_loss     = g_val_loss
+            # Checkpoint based on Macro F1 instead of Val Loss
+            if g_val_macro_f1 > best_val_macro_f1:
+                best_val_macro_f1 = g_val_macro_f1
                 epochs_no_improve = 0
                 save_checkpoint(raw_model, ckpt_path, epoch, optimizer, scheduler)
-                print(f"  Best val loss {g_val_loss:.4f} -- checkpoint saved", flush=True)
+                print(f"  Best val Macro F1 {g_val_macro_f1:.4f} -- checkpoint saved", flush=True)
             else:
                 epochs_no_improve += 1
                 print(f"  No improvement ({epochs_no_improve}/{config.patience})", flush=True)
@@ -254,7 +324,7 @@ def train(rank, world_size, device, outer_fold=1, inner_fold=1):
             break
 
     if is_main:
-        print(f"\nBest val loss : {best_val_loss:.4f}", flush=True)
+        print(f"\nBest val Macro F1 : {best_val_macro_f1:.4f}", flush=True)
         print(f"Checkpoint    : {ckpt_path}", flush=True)
         print(f"Next step     : python evaluate.py "
               f"--outer {outer_fold} --checkpoint {ckpt_path}", flush=True)

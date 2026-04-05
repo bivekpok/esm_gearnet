@@ -9,14 +9,14 @@ class Config:
     
     # LoRA Config
     lora_r       = 8
-    lora_alpha   = 32
+    lora_alpha   = 16
     lora_dropout = 0.1
 
     # -----------------------------------------------------------------------
     # 2. Data & Paths
     # -----------------------------------------------------------------------
     label_csv     = '/work/hdd/bdja/bpokhrel/esm_new2/opmesm_035data.csv'
-    cv_splits_dir = "/work/hdd/bdja/bpokhrel/esm_new2/cv_splits"
+    cv_splits_dir = "/work/hdd/bdja/bpokhrel/esm_new2/cv_splits_cleaned"
     
     output_dir      = '/work/hdd/bdja/bpokhrel/esm_new2/lora_attn/'
     model_save_path = os.path.join(output_dir, 'sweep_checkpoints')
@@ -25,12 +25,15 @@ class Config:
     # 3. Training Hyperparameters
     # -----------------------------------------------------------------------
     batch_size    = 4
+    gradient_accumulation_steps = 8
+    warmup_steps  = 100
     num_epochs    = 250
     patience      = 20
     lr_esmc       = 1e-5
     lr_classifier = 1e-4
     weight_decay  = 1e-5
-    
+    label_smoothing = 0.1  # CrossEntropyLoss; pairs with layer-mean over all transformer hiddens
+
     # Debugging
     test_mode = False
 
