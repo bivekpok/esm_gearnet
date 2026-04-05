@@ -27,14 +27,26 @@ def calculate_metrics(outputs, labels):
     f1 = f1_score(labels.cpu(), preds.cpu(), average='weighted')
     return accuracy, f1
 
+def _checkpoint_root_dir(base_save_path):
+    """
+    base_save_path may be a directory (preferred) or an old-style *.pth file path.
+    If it looks like a checkpoint file, use its parent so os.makedirs does not try
+    to create 'something.pth/run_xxx/' (NotADirectoryError — see sweep logs).
+    """
+    p = os.path.abspath(os.path.expanduser(base_save_path))
+    if p.endswith((".pth", ".pt", ".ckpt")):
+        return os.path.dirname(p)
+    return p
+
+
 def save_checkpoint(model, base_save_path, epoch, optimizer, scheduler):
     """
     Saves the LoRA adapters and the classification head efficiently.
     Prevents saving the massive frozen ESM backbone.
     """
-    # Create a unique folder for this specific W&B sweep run
     run_id = wandb.run.id if wandb.run is not None else "local_run"
-    checkpoint_dir = os.path.join(base_save_path, f"run_{run_id}_best")
+    root = _checkpoint_root_dir(base_save_path)
+    checkpoint_dir = os.path.join(root, f"run_{run_id}_best")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # 1. Save ONLY the Peft/LoRA weights (~10MB)

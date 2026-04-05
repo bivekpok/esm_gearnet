@@ -118,7 +118,7 @@ class ESMCClassifier(nn.Module):
         attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=config.device)
         
         for i, (embed, seq_len) in enumerate(zip(embeddings, lengths)):
-            padded_embeddings[i, :seq_len] = embed[:seq_len]
+            padded_embeddings[i, :seq_len] = embed[1:seq_len+1]
             attention_mask[i, :seq_len] = 1
         
         return self.classifier(padded_embeddings, attention_mask)
